@@ -1,0 +1,1865 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+aaPanel & Cloudflare DNS / Zero Trust 联动管理 CLI 工具 (bt-cf)
+GitHub: https://github.com/wumingshi654/bt-cf
+"""
+
+import os
+import sys
+
+# 若存在 aaPanel 内置 pyenv 环境且当前不在该环境运行，自动切换使用
+PANEL_PYENV = '/www/server/panel/pyenv/bin/python3'
+if os.path.exists(PANEL_PYENV) and sys.executable != PANEL_PYENV:
+    os.execv(PANEL_PYENV, [PANEL_PYENV] + sys.argv)
+
+import json
+import re
+import argparse
+import subprocess
+import socket
+import glob
+
+# 动态确保使用 Python 3
+if sys.version_info[0] < 3:
+    print("错误: bt-cf 需要 Python 3 环境运行！")
+    sys.exit(1)
+
+# 加载 aaPanel 核心类环境
+PANEL_PATH = '/www/server/panel'
+if os.path.exists(PANEL_PATH):
+    os.chdir(PANEL_PATH)
+    if PANEL_PATH not in sys.path:
+        sys.path.insert(0, PANEL_PATH)
+    class_path = os.path.join(PANEL_PATH, 'class')
+    if class_path not in sys.path:
+        sys.path.insert(0, class_path)
+    try:
+        import public
+        import panelSite
+    except Exception:
+        public = None
+        panelSite = None
+else:
+    public = None
+    panelSite = None
+
+try:
+    import requests
+except ImportError:
+    # 尝试在 pyenv 中导入 requests 或使用内置 urllib 替代
+    requests = None
+
+# ANSI 颜色格式化
+COLOR_GREEN = "\033[32m"
+COLOR_RED = "\033[31m"
+COLOR_YELLOW = "\033[33m"
+COLOR_BLUE = "\033[36m"
+COLOR_ORANGE = "\033[38;5;208m"
+COLOR_BOLD = "\033[1m"
+COLOR_RESET = "\033[0m"
+
+def c_green(t): return f"{COLOR_GREEN}{t}{COLOR_RESET}"
+def c_red(t): return f"{COLOR_RED}{t}{COLOR_RESET}"
+def c_yellow(t): return f"{COLOR_YELLOW}{t}{COLOR_RESET}"
+def c_blue(t): return f"{COLOR_BLUE}{t}{COLOR_RESET}"
+def c_orange(t): return f"{COLOR_ORANGE}{t}{COLOR_RESET}"
+def c_bold(t): return f"{COLOR_BOLD}{t}{COLOR_RESET}"
+
+
+def visible_len(s):
+    """计算字符串在终端中的实际可见字符宽度 (去除 ANSI 转义码，计算双宽字符)"""
+    clean = re.sub(r'\033\[[0-9;]*m', '', s)
+    width = 0
+    for ch in clean:
+        if ord(ch) > 0x2e80 or ch in ['🔒', '⚪', '☁', '️', '⚠️', '✅', '❌', '🔴', '🌐']:
+            if ch != '️':  # 变体选择符不占宽度
+                width += 2
+        else:
+            width += 1
+    return width
+
+
+def pad_visible(s, target_width, align='left'):
+    """按终端可见宽度进行对齐填充"""
+    vlen = visible_len(s)
+    padding = max(0, target_width - vlen)
+    if align == 'right':
+        return ' ' * padding + s
+    elif align == 'center':
+        left_pad = padding // 2
+        right_pad = padding - left_pad
+        return ' ' * left_pad + s + ' ' * right_pad
+    else:
+        return s + ' ' * padding
+
+
+# =====================================================================
+# 动态 VPS IP 自动检测机制 (多 VPS 支持)
+# =====================================================================
+
+def detect_vps_ip():
+    """
+    自动检测当前 VPS 的外网公网 IPv4 地址。
+    按优先级排查:
+    1. aaPanel 的 iplist.txt 缓存
+    2. 本机网络接口上的全局公网 IPv4 地址
+    3. 多节点外部无代理 HTTP 查询兜底
+    """
+    # 1. 检查 aaPanel 已存的公网 IP 记录
+    iplist_file = '/www/server/panel/data/iplist.txt'
+    if os.path.exists(iplist_file):
+        try:
+            with open(iplist_file, 'r') as f:
+                ip = f.read().strip()
+                if re.match(r'^([0-9]{1,3}\.){3}[0-9]{1,3}$', ip) and not ip.startswith('127.'):
+                    return ip
+        except Exception:
+            pass
+
+    # 2. 检查本机网络接口全局 IP (排除私有保留网段)
+    try:
+        out = subprocess.check_output(['ip', '-4', 'addr', 'show', 'scope', 'global'], timeout=3).decode('utf-8')
+        for match in re.finditer(r'inet\s+([0-9.]+)/\d+', out):
+            ip = match.group(1)
+            if not (ip.startswith('10.') or ip.startswith('172.') or ip.startswith('192.168.') or ip.startswith('127.')):
+                return ip
+    except Exception:
+        pass
+
+    # 3. 外部 API 查询兜底 (直连无代理)
+    services = ['https://api.ipify.org', 'https://ifconfig.me/ip', 'https://icanhazip.com']
+    for url in services:
+        try:
+            cmd = ['curl', '-4', '-s', '--connect-timeout', '3', '--noproxy', '*', url]
+            ip = subprocess.check_output(cmd, timeout=4).decode('utf-8').strip()
+            if re.match(r'^([0-9]{1,3}\.){3}[0-9]{1,3}$', ip) and not ip.startswith('127.'):
+                return ip
+        except Exception:
+            continue
+
+    return '127.0.0.1'
+
+
+# =====================================================================
+# Cloudflare API 核心客户端 (独立且零外部插件依赖)
+# =====================================================================
+
+CONFIG_PATHS = [
+    '/etc/bt-cf/config.json',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json'),
+    '/www/server/panel/plugin/cloudflare_helper/config.json'
+]
+
+class CloudflareManager:
+    def __init__(self, override_ip=None):
+        self.config_file = CONFIG_PATHS[0]
+        for p in CONFIG_PATHS:
+            if os.path.exists(p):
+                self.config_file = p
+                break
+        self.conf = self.load_config()
+        self.override_ip = override_ip
+        if requests:
+            self.session = requests.Session()
+            self.session.trust_env = False
+        else:
+            self.session = None
+
+    def load_config(self):
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def save_config(self, conf):
+        os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
+        with open(self.config_file, 'w') as f:
+            json.dump(conf, f, indent=2)
+        self.conf = conf
+
+    def get_server_ip(self):
+        """优先使用命令行参数指定的 IP，其次配置文件，最后动态检测"""
+        if self.override_ip:
+            return self.override_ip
+        conf_ip = self.conf.get('server_ip', '').strip()
+        if conf_ip and conf_ip != '127.0.0.1':
+            return conf_ip
+        return detect_vps_ip()
+
+    def get_token(self):
+        return self.conf.get('api_token', '').strip()
+
+    def get_app_name(self):
+        return self.conf.get('app_name', 'APP').strip()
+
+    def cf_request(self, method, endpoint, payload=None):
+        """发起 Cloudflare v4 REST API 请求"""
+        token = self.get_token()
+        if not token:
+            return False, "未配置 Cloudflare API Token。请先执行: bt-cf config --token <你的Token>"
+
+        url = "https://api.cloudflare.com/client/v4" + endpoint
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        # 优先使用 requests
+        if self.session:
+            try:
+                data_json = json.dumps(payload) if payload is not None else None
+                resp = self.session.request(method.upper(), url, headers=headers, data=data_json, timeout=20)
+                try:
+                    res_json = resp.json()
+                except Exception:
+                    return False, f"HTTP {resp.status_code}: 返回非 JSON 内容"
+
+                if resp.status_code in (200, 201) and res_json.get('success', False):
+                    return True, res_json.get('result')
+                else:
+                    err_msgs = [e.get('message', str(e)) for e in res_json.get('errors', [])]
+                    msg = "; ".join(err_msgs) if err_msgs else f"HTTP {resp.status_code}: {resp.text[:200]}"
+                    return False, msg
+            except Exception as e:
+                return False, f"请求 Cloudflare 失败: {str(e)}"
+
+        # 回退使用 curl 命令行请求
+        try:
+            cmd = ['curl', '-4', '--noproxy', '*', '-s', '-X', method.upper(), url]
+            for k, v in headers.items():
+                cmd.extend(['-H', f'{k}: {v}'])
+            if payload is not None:
+                cmd.extend(['-d', json.dumps(payload)])
+
+            raw = subprocess.check_output(cmd, timeout=20).decode('utf-8')
+            res_json = json.loads(raw)
+            if res_json.get('success', False):
+                return True, res_json.get('result')
+            else:
+                err_msgs = [e.get('message', str(e)) for e in res_json.get('errors', [])]
+                return False, "; ".join(err_msgs) if err_msgs else raw[:200]
+        except Exception as e:
+            return False, f"执行请求异常: {str(e)}"
+
+    def get_account_id(self):
+        """获取 Cloudflare Account ID (优先配置缓存，其次 /accounts，再次 /zones 关联)"""
+        acc_id = self.conf.get('account_id')
+        if acc_id:
+            return acc_id
+
+        # 尝试从 /accounts 获取
+        ok_acc, accounts = self.cf_request('GET', '/accounts')
+        if ok_acc and isinstance(accounts, list) and len(accounts) > 0:
+            acc_id = accounts[0].get('id')
+            if accounts[0].get('name') and not self.conf.get('account_name'):
+                self.conf['account_name'] = accounts[0].get('name')
+
+        # 如果 /accounts 返回空 (Scoped API Token 场景)，从 /zones 获取关联 account
+        if not acc_id:
+            ok_z, zones = self.cf_request('GET', '/zones?per_page=50')
+            if ok_z and isinstance(zones, list) and len(zones) > 0:
+                for z in zones:
+                    acc = z.get('account', {})
+                    if acc.get('id'):
+                        acc_id = acc.get('id')
+                        if acc.get('name') and not self.conf.get('account_name'):
+                            self.conf['account_name'] = acc.get('name')
+                        break
+
+        if acc_id:
+            self.conf['account_id'] = acc_id
+            self.save_config(self.conf)
+        return acc_id
+
+    def test_connection(self):
+        """测试 Token 有效性与 Zero Trust APP 存在性"""
+        ok, res = self.cf_request('GET', '/user/tokens/verify')
+        if not ok:
+            return False, f"Token 验证失败: {res}"
+
+        # 获取绑定的账户
+        acc_id = self.get_account_id()
+        acc_name = self.conf.get('account_name')
+
+        # 获取 Zone 列表
+        ok_z, zones = self.cf_request('GET', '/zones?per_page=50')
+
+        # 获取 Zero Trust App 详情
+        app_name = self.get_app_name()
+        ok_app, app_data = self.get_access_app(acc_id, app_name)
+
+        return True, {
+            "account_id": acc_id,
+            "account_name": acc_name,
+            "zones": zones if ok_z else [],
+            "app": app_data if ok_app else None
+        }
+
+    def get_access_app(self, account_id=None, app_name=None):
+        """查找指定名称的 Cloudflare Zero Trust (Access) Application"""
+        app_name = app_name or self.get_app_name()
+        account_id = account_id or self.get_account_id()
+
+        if not account_id:
+            return False, "无法获取 Cloudflare Account ID，请检查 API Token 权限"
+
+        ok, apps = self.cf_request('GET', f'/accounts/{account_id}/access/apps')
+        if not ok or not isinstance(apps, list):
+            return False, f"无法获取 Access Apps: {apps}"
+
+        for app in apps:
+            if app.get('name', '').strip().lower() == app_name.lower():
+                return True, app
+
+        return False, f"未找到名为 [{app_name}] 的 Zero Trust 应用程序"
+
+    def get_zt_domains(self):
+        """获取 Zero Trust 应用程序中已受保护的所有域名"""
+        ok_app, app = self.get_access_app()
+        if not ok_app or not app:
+            return False, app
+
+        domains = []
+        primary_domain = app.get('domain', '').strip().lower()
+        if primary_domain:
+            domains.append(primary_domain)
+
+        destinations = app.get('destinations', []) or []
+        for dest in destinations:
+            uri = dest.get('uri', '').strip().lower()
+            if uri:
+                clean_d = re.sub(r'^https?://', '', uri).split('/')[0].split(':')[0]
+                if clean_d and clean_d not in domains:
+                    domains.append(clean_d)
+
+        return True, {
+            "app_id": app.get('id'),
+            "app_name": app.get('name'),
+            "primary_domain": primary_domain,
+            "domains": domains,
+            "count": len(domains)
+        }
+
+    def toggle_domain_zt(self, domain, action='toggle'):
+        """添加或移出 Zero Trust 保护"""
+        domain = domain.strip().lower()
+        ok_app, app = self.get_access_app()
+        if not ok_app or not app:
+            return False, f"无法获取 Zero Trust 应用: {app}"
+
+        account_id = self.get_account_id()
+        if not account_id:
+            return False, "无法获取 Cloudflare Account ID，请检查 API Token 权限"
+        app_id = app.get('id')
+
+        # 获取全量配置
+        ok_detail, full_app = self.cf_request('GET', f'/accounts/{account_id}/access/apps/{app_id}')
+        if not ok_detail:
+            full_app = app
+
+        current_destinations = full_app.get('destinations', []) or []
+        primary_domain = full_app.get('domain', '').strip().lower()
+
+        # 判断当前是否已在保护中
+        existing_uris = set(d.get('uri', '').strip().lower() for d in current_destinations if d.get('uri'))
+        is_in_dest = (domain in existing_uris or (domain + '/*') in existing_uris)
+        is_primary = (domain == primary_domain)
+        currently_in = is_in_dest or is_primary
+
+        if action == 'toggle':
+            target_action = 'remove' if currently_in else 'add'
+        elif action in ['add', 'on']:
+            target_action = 'add'
+        else:
+            target_action = 'remove'
+
+        if target_action == 'add':
+            if currently_in:
+                return True, f"域名 [{domain}] 已经在 Zero Trust ({full_app.get('name')}) 保护中。"
+
+            new_destinations = list(current_destinations)
+            new_destinations.append({"type": "public", "uri": domain})
+
+            payload = {
+                "name": full_app.get('name'),
+                "domain": full_app.get('domain'),
+                "type": full_app.get('type', 'self_hosted'),
+                "session_duration": full_app.get('session_duration', '24h'),
+                "destinations": new_destinations
+            }
+            ok_u, res_u = self.cf_request('PUT', f'/accounts/{account_id}/access/apps/{app_id}', payload)
+            if ok_u:
+                return True, f"成功将 [{domain}] 加入 Zero Trust ({full_app.get('name')})！"
+            return False, f"更新 Zero Trust 失败: {res_u}"
+
+        else:
+            if not currently_in:
+                return True, f"域名 [{domain}] 本来就不在 Zero Trust 保护中。"
+
+            if is_primary:
+                return False, f"域名 [{domain}] 是该 APP 的主域名 (Primary Domain)，Cloudflare 规定主域名不能直接剔除。如需剔除请在 Cloudflare 后台调整主域名。"
+
+            new_destinations = []
+            for dest in current_destinations:
+                uri = dest.get('uri', '').strip().lower()
+                clean = re.sub(r'^https?://', '', uri).split('/')[0].split(':')[0]
+                if clean != domain:
+                    new_destinations.append(dest)
+
+            payload = {
+                "name": full_app.get('name'),
+                "domain": full_app.get('domain'),
+                "type": full_app.get('type', 'self_hosted'),
+                "session_duration": full_app.get('session_duration', '24h'),
+                "destinations": new_destinations
+            }
+            ok_u, res_u = self.cf_request('PUT', f'/accounts/{account_id}/access/apps/{app_id}', payload)
+            if ok_u:
+                return True, f"成功将 [{domain}] 从 Zero Trust 移出！"
+            return False, f"更新 Zero Trust 失败: {res_u}"
+
+    def find_matching_zone(self, domain):
+        """根据域名查找 Cloudflare 对应的托管 Zone"""
+        domain = re.sub(r'^https?://', '', domain).split(':')[0].strip().lower()
+        ok, zones = self.cf_request('GET', '/zones')
+        if not ok or not zones:
+            # 尝试使用配置里的兜底
+            cfg_zone = self.conf.get('zone_name', '').lower()
+            cfg_zid = self.conf.get('zone_id')
+            if cfg_zone and cfg_zid and (domain == cfg_zone or domain.endswith('.' + cfg_zone)):
+                return True, {"id": cfg_zid, "name": cfg_zone}
+            return False, f"无法获取 Cloudflare Zones: {zones}"
+
+        best_match = None
+        best_len = 0
+        for z in zones:
+            z_name = z.get('name', '').lower().strip()
+            if domain == z_name or domain.endswith('.' + z_name):
+                if len(z_name) > best_len:
+                    best_match = z
+                    best_len = len(z_name)
+
+        if best_match:
+            return True, best_match
+        return False, f"未在 Cloudflare 找到域名 [{domain}] 对应的托管 Zone"
+
+
+# =====================================================================
+# aaPanel 辅助功能 (反向代理与默认 SSL 自动化)
+# =====================================================================
+
+def extract_proxy_from_nginx_conf(filepath):
+    """从 Nginx 配置文件中解析真实的 proxy_pass 目标"""
+    if not os.path.exists(filepath):
+        return None
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+
+        # 过滤注释行
+        lines = [line for line in content.splitlines() if not line.strip().startswith('#')]
+        cleaned = '\n'.join(lines)
+
+        # 优先查找根代理 location / 中的 proxy_pass
+        root_loc = re.search(r'location\s+(?:(?:\^~|=)\s+)?/\s*\{([^}]+)\}', cleaned)
+        if root_loc:
+            m = re.search(r'proxy_pass\s+([^;\s]+);', root_loc.group(1))
+            if m:
+                target = m.group(1).strip()
+                if not target.startswith('$'):
+                    return target.rstrip('/')
+
+        # 兜底查找任意有效 proxy_pass
+        matches = re.findall(r'proxy_pass\s+([^;\s]+);', cleaned)
+        for m in matches:
+            target = m.strip()
+            if target and not target.startswith('$'):
+                return target.rstrip('/')
+    except Exception:
+        pass
+    return None
+
+
+def extract_proxy_from_apache_conf(filepath):
+    """从 Apache 配置文件中解析 ProxyPass 目标"""
+    if not os.path.exists(filepath):
+        return None
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        lines = [line.strip() for line in content.splitlines() if not line.strip().startswith('#')]
+        for line in lines:
+            m = re.search(r'ProxyPass\s+(?:/\s+)?([^\s;]+)', line)
+            if m:
+                target = m.group(1).strip()
+                if not target.startswith('!'):
+                    return target.rstrip('/')
+    except Exception:
+        pass
+    return None
+
+
+def extract_proxy_from_ols_conf(filepath):
+    """从 OpenLiteSpeed 配置文件中解析 address 目标"""
+    if not os.path.exists(filepath):
+        return None
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        lines = [line.strip() for line in content.splitlines() if not line.strip().startswith('#')]
+        for line in lines:
+            m = re.search(r'address\s+([^\s;]+)', line)
+            if m:
+                return m.group(1).strip().rstrip('/')
+    except Exception:
+        pass
+    return None
+
+
+def get_site_proxies():
+    """
+    读取 aaPanel 中所有站点的反向代理配置映射 {sitename: proxysite}
+    优先直接从 Web 服务器 (Nginx / Apache / OpenLiteSpeed) 的实际配置文件中读取，
+    确保与运行时的真实反代目标保持 100% 一致；若配置文件缺失则回退到 proxyfile.json。
+    同时，若检测到 proxyfile.json 与真实配置存在偏差，自动同步修正 proxyfile.json。
+    """
+    proxy_map = {}
+    proxyfile = '/www/server/panel/data/proxyfile.json'
+
+    # 1. 优先读取 Nginx 实际反代配置 (/www/server/panel/vhost/nginx/proxy/{sitename}/*.conf)
+    nginx_proxy_base = '/www/server/panel/vhost/nginx/proxy'
+    if os.path.isdir(nginx_proxy_base):
+        try:
+            for sname in os.listdir(nginx_proxy_base):
+                sdir = os.path.join(nginx_proxy_base, sname)
+                if os.path.isdir(sdir):
+                    confs = sorted([c for c in os.listdir(sdir) if c.endswith('.conf')])
+                    for conf in confs:
+                        target = extract_proxy_from_nginx_conf(os.path.join(sdir, conf))
+                        if target:
+                            proxy_map[sname.lower()] = target
+                            break
+        except Exception:
+            pass
+
+    # 2. 检查 Nginx 主虚拟主机配置文件中直接写入的 proxy_pass
+    nginx_vhost_base = '/www/server/panel/vhost/nginx'
+    if os.path.isdir(nginx_vhost_base):
+        try:
+            for conf_file in glob.glob(os.path.join(nginx_vhost_base, '*.conf')):
+                sname = os.path.basename(conf_file)[:-5].lower()
+                if sname not in proxy_map:
+                    target = extract_proxy_from_nginx_conf(conf_file)
+                    if target:
+                        proxy_map[sname] = target
+        except Exception:
+            pass
+
+    # 3. 检查 Apache 实际反代配置
+    apache_proxy_base = '/www/server/panel/vhost/apache/proxy'
+    if os.path.isdir(apache_proxy_base):
+        try:
+            for sname in os.listdir(apache_proxy_base):
+                sdir = os.path.join(apache_proxy_base, sname)
+                if os.path.isdir(sdir) and sname.lower() not in proxy_map:
+                    confs = sorted([c for c in os.listdir(sdir) if c.endswith('.conf')])
+                    for conf in confs:
+                        target = extract_proxy_from_apache_conf(os.path.join(sdir, conf))
+                        if target:
+                            proxy_map[sname.lower()] = target
+                            break
+        except Exception:
+            pass
+
+    # 4. 检查 OpenLiteSpeed 实际反代配置
+    ols_proxy_base = '/www/server/panel/vhost/openlitespeed/proxy'
+    if os.path.isdir(ols_proxy_base):
+        try:
+            for sname in os.listdir(ols_proxy_base):
+                sdir = os.path.join(ols_proxy_base, sname)
+                if os.path.isdir(sdir) and sname.lower() not in proxy_map:
+                    confs = sorted([c for c in os.listdir(sdir) if c.endswith('.conf')])
+                    for conf in confs:
+                        target = extract_proxy_from_ols_conf(os.path.join(sdir, conf))
+                        if target:
+                            proxy_map[sname.lower()] = target
+                            break
+        except Exception:
+            pass
+
+    # 5. 回退 / 兜底读取 proxyfile.json，并自动校准同步
+    proxyfile_data = []
+    need_sync_proxyfile = False
+    if os.path.exists(proxyfile):
+        try:
+            with open(proxyfile, 'r', encoding='utf-8') as f:
+                proxyfile_data = json.load(f)
+            if isinstance(proxyfile_data, list):
+                for item in proxyfile_data:
+                    sname = item.get('sitename', '').strip().lower()
+                    psite = item.get('proxysite', '').strip()
+                    if not sname:
+                        continue
+                    if sname in proxy_map:
+                        # 检查 proxyfile.json 是否有旧数据，如果有差异则标记同步
+                        real_site = proxy_map[sname]
+                        if psite.rstrip('/') != real_site.rstrip('/'):
+                            item['proxysite'] = real_site
+                            need_sync_proxyfile = True
+                    else:
+                        if psite and int(item.get('type', 1)) == 1:
+                            proxy_map[sname] = psite.rstrip('/')
+        except Exception:
+            pass
+
+    # 6. 如果 proxyfile.json 存在过时数据，自动回写保持面板状态一致
+    if need_sync_proxyfile and proxyfile_data:
+        try:
+            with open(proxyfile, 'w', encoding='utf-8') as f:
+                json.dump(proxyfile_data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    return proxy_map
+
+
+def get_docker_port_map():
+    """读取 Docker 容器端口映射 {port_str: container_name}"""
+    d_map = {}
+    try:
+        out = subprocess.check_output(['docker', 'ps', '--format', '{{.Names}}\t{{.Ports}}'], timeout=2).decode('utf-8', errors='ignore')
+        for line in out.splitlines():
+            line = line.strip()
+            if not line or '\t' not in line:
+                continue
+            name, ports = line.split('\t', 1)
+            for m in re.finditer(r':(\d+)(?:-(\d+))?->', ports):
+                p1 = int(m.group(1))
+                p2 = int(m.group(2)) if m.group(2) else p1
+                for p in range(p1, p2 + 1):
+                    d_map[str(p)] = name
+    except Exception:
+        pass
+    return d_map
+
+
+def get_listening_processes():
+    """获取本机当前正在监听的 TCP 端口与对应进程映射 {port_str: process_description}"""
+    port_map = {}
+    docker_map = get_docker_port_map()
+
+    # 1. 优先尝试使用 ss -tlnp
+    try:
+        out = subprocess.check_output(['ss', '-tlnp'], timeout=3).decode('utf-8', errors='ignore')
+        for line in out.splitlines():
+            line = line.strip()
+            if not line.startswith('LISTEN'):
+                continue
+
+            m_port = re.search(r':(\d+)\s+', line)
+            if not m_port:
+                continue
+            port = m_port.group(1)
+
+            m_user = re.search(r'users:\(\(\"([^\"]+)\",pid=(\d+)', line)
+            pname = m_user.group(1) if m_user else ''
+            pid = m_user.group(2) if m_user else ''
+
+            if port in docker_map:
+                c_name = docker_map[port]
+                port_map[port] = f"docker:{c_name}"
+            elif pname:
+                display_name = pname
+                if '-linux-' in pname:
+                    display_name = pname.split('-linux-')[0]
+                elif pname in ['python', 'python3', 'node'] and pid:
+                    try:
+                        with open(f'/proc/{pid}/cmdline', 'r') as f:
+                            args = [a for a in f.read().split('\0') if a]
+                            meaningful = [a for a in args[1:] if not a.startswith('-')]
+                            if meaningful:
+                                script_or_mod = os.path.basename(meaningful[0])
+                                display_name = f"{pname}:{script_or_mod}"
+                    except Exception:
+                        pass
+                port_map[port] = f"{display_name}({pid})" if pid else display_name
+            else:
+                port_map[port] = "running"
+    except Exception:
+        pass
+
+    # 2. 若 ss 未采集到数据，尝试 lsof 兜底
+    if not port_map:
+        try:
+            out = subprocess.check_output(['lsof', '-iTCP', '-sTCP:LISTEN', '-n', '-P'], timeout=3).decode('utf-8', errors='ignore')
+            for line in out.splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 9:
+                    cmd_name = parts[0]
+                    pid = parts[1]
+                    addr = parts[8]
+                    if ':' in addr:
+                        port = addr.split(':')[-1]
+                        if port.isdigit():
+                            if port in docker_map:
+                                port_map[port] = f"docker:{docker_map[port]}"
+                            else:
+                                port_map[port] = f"{cmd_name}({pid})"
+        except Exception:
+            pass
+
+    return port_map
+
+
+def extract_proxy_port(proxy_val, current_ip=None):
+    """
+    从反向代理配置中提取目标端口：
+    - 返回 ('LOCAL', port_str) 如果是本地端口 (127.0.0.1 / localhost / 0.0.0.0 / 本机IP / 纯端口)
+    - 返回 ('EXTERNAL', host_str) 如果是外部目标
+    - 返回 (None, None) 如果无法提取或无代理
+    """
+    if not proxy_val:
+        return None, None
+    clean = proxy_val.replace('http://', '').replace('https://', '').split('/')[0].strip()
+    if not clean:
+        return None, None
+
+    if ':' in clean:
+        parts = clean.split(':', 1)
+        host = parts[0].strip().lower()
+        port = parts[1].strip()
+        if not port.isdigit():
+            return 'EXTERNAL', clean
+        if host in ['', '127.0.0.1', 'localhost', '0.0.0.0', '::1']:
+            return 'LOCAL', port
+        if current_ip and host == current_ip:
+            return 'LOCAL', port
+        return 'EXTERNAL', clean
+    elif clean.isdigit():
+        return 'LOCAL', clean
+    else:
+        return 'EXTERNAL', clean
+
+
+def normalize_proxy_target(proxy_target):
+    """
+    标准化反向代理目标：
+    支持端口号 (如 8123) 或完整 URL (如 http://127.0.0.1:8123)
+    返回 (normalized_url, error_msg)
+    """
+    target_str = str(proxy_target).strip()
+    if not target_str:
+        return None, "反向代理目标不能为空"
+    if re.match(r'^\d+$', target_str):
+        port = int(target_str)
+        if not (1 <= port <= 65535):
+            return None, f"端口号超出有效范围 (1-65535): {target_str}"
+        return f"http://127.0.0.1:{port}", None
+    elif target_str.startswith('http://') or target_str.startswith('https://'):
+        return target_str.rstrip('/'), None
+    else:
+        return f"http://{target_str}".rstrip('/'), None
+
+
+def setup_site_proxy(domain, proxy_target):
+    """
+    为 aaPanel 站点配置反向代理：
+    支持 proxy_target 为端口号 (如 8123) 或完整 URL (如 http://127.0.0.1:8123)
+    """
+    if not proxy_target:
+        return True, None
+    if not panelSite or not public:
+        return False, "未检测到 aaPanel 核心环境"
+
+    proxysite, err = normalize_proxy_target(proxy_target)
+    if err:
+        return False, err
+
+    try:
+        ps = panelSite.panelSite()
+        get = public.dict_obj()
+        get.sitename = domain
+        get.proxyname = "proxy_" + public.md5(domain)[:5]
+        get.proxysite = proxysite
+        get.proxydir = "/"
+        get.todomain = "$host"
+        get.type = 1
+        get.cache = 0
+        get.subfilter = '[{"sub1": "", "sub2": ""}, {"sub1": "", "sub2": ""}, {"sub1": "", "sub2": ""}]'
+        get.advanced = 0
+        get.cachetime = 1
+        get.nocheck = "1"
+
+        res = ps.CreateProxy(get)
+        if isinstance(res, dict) and res.get('status'):
+            return True, proxysite
+        elif isinstance(res, dict):
+            return False, res.get('msg', str(res))
+        return True, proxysite
+    except Exception as e:
+        return False, str(e)
+
+
+def _replace_nginx_proxy_pass(content, new_target):
+    """在 Nginx 代理配置中精准替换根 location / (或首个有效) proxy_pass，保留自定义指令"""
+    # 1. 优先替换 location / { ... } 块内的 proxy_pass
+    loc_pat = re.compile(r'(location\s+(?:(?:\^~|=)\s+)?/\s*\{[^}]*?proxy_pass\s+)([^;\s]+)(;)', re.DOTALL)
+    if loc_pat.search(content):
+        return loc_pat.sub(lambda m: f"{m.group(1)}{new_target}{m.group(3)}", content, count=1), True
+
+    # 2. 兜底替换首个非变量 proxy_pass
+    any_pat = re.compile(r'(^\s*proxy_pass\s+)(?!\$)([^;\s]+)(;)', re.MULTILINE)
+    if any_pat.search(content):
+        return any_pat.sub(lambda m: f"{m.group(1)}{new_target}{m.group(3)}", content, count=1), True
+
+    return content, False
+
+
+def update_site_proxy(domain, proxy_target):
+    """
+    更新 aaPanel 站点的反向代理目标 (保留原有自定义 Nginx 规则，若站点尚未配置代理则自动创建)：
+    返回 (ok, new_proxysite_or_error)
+    """
+    if not panelSite or not public:
+        return False, "未检测到 aaPanel 核心环境"
+
+    proxysite, err = normalize_proxy_target(proxy_target)
+    if err:
+        return False, err
+
+    updated_any = False
+    backups = []
+
+    try:
+        # 1. 更新 Nginx 代理配置 (/www/server/panel/vhost/nginx/proxy/{domain}/*.conf)
+        nginx_proxy_dir = f"/www/server/panel/vhost/nginx/proxy/{domain}"
+        if os.path.isdir(nginx_proxy_dir):
+            confs = sorted([c for c in os.listdir(nginx_proxy_dir) if c.endswith('.conf')])
+            for conf in confs:
+                fpath = os.path.join(nginx_proxy_dir, conf)
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                    old_content = f.read()
+                new_content, replaced = _replace_nginx_proxy_pass(old_content, proxysite)
+                if replaced:
+                    backups.append((fpath, old_content))
+                    with open(fpath, 'w', encoding='utf-8') as f:
+                        f.write(new_content)
+                    updated_any = True
+                    break
+
+        # 2. 若未在 proxy 子目录找到，检查 Nginx 主虚拟主机配置文件
+        if not updated_any:
+            nginx_vhost = f"/www/server/panel/vhost/nginx/{domain}.conf"
+            if os.path.exists(nginx_vhost):
+                with open(nginx_vhost, 'r', encoding='utf-8', errors='ignore') as f:
+                    old_content = f.read()
+                new_content, replaced = _replace_nginx_proxy_pass(old_content, proxysite)
+                if replaced:
+                    backups.append((nginx_vhost, old_content))
+                    with open(nginx_vhost, 'w', encoding='utf-8') as f:
+                        f.write(new_content)
+                    updated_any = True
+
+        # 3. 同步更新 Apache 代理配置 (若存在)
+        apache_proxy_dir = f"/www/server/panel/vhost/apache/proxy/{domain}"
+        if os.path.isdir(apache_proxy_dir):
+            confs = sorted([c for c in os.listdir(apache_proxy_dir) if c.endswith('.conf')])
+            for conf in confs:
+                fpath = os.path.join(apache_proxy_dir, conf)
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                    old_content = f.read()
+                new_content = re.sub(
+                    r'(ProxyPass(?:Reverse)?\s+/\s+)([^\s;]+)',
+                    lambda m: f"{m.group(1)}{proxysite}/",
+                    old_content
+                )
+                if new_content != old_content:
+                    backups.append((fpath, old_content))
+                    with open(fpath, 'w', encoding='utf-8') as f:
+                        f.write(new_content)
+                    updated_any = True
+
+        # 4. 同步更新 OpenLiteSpeed 代理配置 (若存在)
+        ols_proxy_dir = f"/www/server/panel/vhost/openlitespeed/proxy/{domain}"
+        if os.path.isdir(ols_proxy_dir):
+            confs = sorted([c for c in os.listdir(ols_proxy_dir) if c.endswith('.conf')])
+            for conf in confs:
+                fpath = os.path.join(ols_proxy_dir, conf)
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                    old_content = f.read()
+                new_content = re.sub(
+                    r'(address\s+)([^\s;]+)',
+                    lambda m: f"{m.group(1)}{proxysite}",
+                    old_content
+                )
+                if new_content != old_content:
+                    backups.append((fpath, old_content))
+                    with open(fpath, 'w', encoding='utf-8') as f:
+                        f.write(new_content)
+                    updated_any = True
+
+        # 5. 若站点尚未配置过任何反代，直接调用 CreateProxy 创建
+        if not updated_any:
+            return setup_site_proxy(domain, proxysite)
+
+        # 6. 验证 Web 服务配置语法并重载
+        if public.get_webserver() == 'nginx' and os.path.exists('/www/server/nginx/sbin/nginx'):
+            chk = subprocess.run(
+                ['/www/server/nginx/sbin/nginx', '-t'],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5
+            )
+            if chk.returncode != 0:
+                # 语法校验失败则回滚所有修改
+                for fpath, old_content in backups:
+                    with open(fpath, 'w', encoding='utf-8') as f:
+                        f.write(old_content)
+                err_msg = chk.stderr.decode('utf-8', errors='ignore').strip()
+                return False, f"Nginx 配置语法校验失败，已回滚修改: {err_msg}"
+
+        # 7. 同步更新 /www/server/panel/data/proxyfile.json
+        proxyfile = '/www/server/panel/data/proxyfile.json'
+        if os.path.exists(proxyfile):
+            try:
+                with open(proxyfile, 'r', encoding='utf-8') as f:
+                    pdata = json.load(f)
+                if isinstance(pdata, list):
+                    changed = False
+                    for item in pdata:
+                        if item.get('sitename', '').strip().lower() == domain.lower():
+                            if item.get('proxydir', '/') == '/' or not changed:
+                                item['proxysite'] = proxysite
+                                item['type'] = 1
+                                changed = True
+                    if changed:
+                        with open(proxyfile, 'w', encoding='utf-8') as f:
+                            json.dump(pdata, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+        # 8. 重载 Web 服务使配置生效
+        public.serviceReload()
+        return True, proxysite
+    except Exception as e:
+        for fpath, old_content in backups:
+            try:
+                with open(fpath, 'w', encoding='utf-8') as f:
+                    f.write(old_content)
+            except Exception:
+                pass
+        return False, str(e)
+
+
+def resolve_site_target(target):
+    """
+    将用户传入的站点 ID 或域名解析为 aaPanel 主站点名称：
+    返回 (site_dict, error_msg)
+    """
+    if not public:
+        return None, "未检测到 aaPanel 核心环境"
+
+    target_str = str(target).strip()
+    if not target_str:
+        return None, "站点 ID 或域名不能为空"
+
+    # 1. 如果是纯数字，按站点 ID 查询
+    if re.match(r'^\d+$', target_str):
+        site = public.M('sites').where('id=?', (int(target_str),)).find()
+        if site:
+            return site, None
+        return None, f"未在 aaPanel 中找到 ID 为 [{target_str}] 的站点"
+
+    # 2. 按主站点名查询
+    dom_lower = target_str.lower()
+    site = public.M('sites').where('name=?', (dom_lower,)).find()
+    if site:
+        return site, None
+
+    # 3. 按绑定域名表查询 (支持通过别名域名定位主站点)
+    dom_rec = public.M('domain').where('name=?', (dom_lower,)).find()
+    if dom_rec and dom_rec.get('pid'):
+        site = public.M('sites').where('id=?', (dom_rec['pid'],)).find()
+        if site:
+            return site, None
+
+    return None, f"未在 aaPanel 中找到域名为 [{target_str}] 的站点"
+
+
+def configure_site_ssl(domain):
+    """
+    为 aaPanel 站点配置默认 SSL：
+    1. 优先复用本机已有的通配符证书或对应 Zone 证书 (如 *.example.com)
+    2. 若无可用证书，使用 openssl 自动生成 10 年自签名 Origin 证书 (支持 Cloudflare Full SSL)
+    3. 写入 /www/server/panel/vhost/cert/{domain}/
+    4. 调用 aaPanel 核心 SetSSLConf 将证书绑定到 Nginx 站点 (开启 443 端口与 HTTPS 协议)
+    """
+    if not panelSite or not public:
+        return False, "未检测到 aaPanel 环境"
+
+    cert_dir = f"/www/server/panel/vhost/cert/{domain}"
+    fullchain_path = f"{cert_dir}/fullchain.pem"
+    privkey_path = f"{cert_dir}/privkey.pem"
+
+    os.makedirs(cert_dir, exist_ok=True)
+
+    # 1. 如果已存在有效证书，直接跳过生成
+    has_valid_cert = False
+    if os.path.exists(fullchain_path) and os.path.exists(privkey_path):
+        if os.path.getsize(fullchain_path) > 100 and os.path.getsize(privkey_path) > 100:
+            has_valid_cert = True
+
+    # 2. 尝试从本地寻找匹配的证书 (如父域名通配符证书)
+    if not has_valid_cert:
+        matched_src = None
+        parts = domain.split('.')
+        for i in range(1, len(parts) - 1):
+            parent_zone = '.'.join(parts[i:])
+            cand = f'/www/server/panel/vhost/ssl/{parent_zone}'
+            if os.path.exists(f'{cand}/fullchain.pem') and os.path.exists(f'{cand}/privkey.pem'):
+                matched_src = cand
+                break
+
+        if not matched_src:
+            import glob
+            for cand in glob.glob('/www/server/panel/vhost/cert/*'):
+                if cand != cert_dir and os.path.exists(f'{cand}/fullchain.pem') and os.path.exists(f'{cand}/privkey.pem'):
+                    try:
+                        out = subprocess.check_output(
+                            ['openssl', 'x509', '-in', f'{cand}/fullchain.pem', '-noout', '-text'],
+                            timeout=2
+                        ).decode('utf-8')
+                        for i in range(1, len(parts) - 1):
+                            parent_zone = '.'.join(parts[i:])
+                            if f'*.{parent_zone}' in out or domain in out:
+                                matched_src = cand
+                                break
+                    except Exception:
+                        continue
+                if matched_src:
+                    break
+
+        if matched_src:
+            import shutil
+            shutil.copy2(f'{matched_src}/fullchain.pem', fullchain_path)
+            shutil.copy2(f'{matched_src}/privkey.pem', privkey_path)
+            has_valid_cert = True
+        else:
+            # 3. 自动生成自签名 Origin 证书 (10年有效期)
+            cmd = [
+                'openssl', 'req', '-x509', '-nodes', '-days', '3650',
+                '-newkey', 'rsa:2048',
+                '-keyout', privkey_path,
+                '-out', fullchain_path,
+                '-subj', f"/C=US/ST=CA/L=San Francisco/O=CloudFlare Origin/CN={domain}"
+            ]
+            try:
+                subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                has_valid_cert = True
+            except Exception as e:
+                return False, f"生成 SSL 证书失败: {str(e)}"
+
+    # 4. 绑定证书到站点 Nginx 配置
+    try:
+        ps = panelSite.panelSite()
+        get = public.dict_obj()
+        get.siteName = domain
+        res = ps.SetSSLConf(get)
+        if isinstance(res, dict) and res.get('status') is False:
+            return False, res.get('msg', 'SetSSLConf 绑定失败')
+        return True, "SSL 证书已配置并成功启用 (443端口开启)"
+    except Exception as e:
+        return False, f"绑定 SSL 配置异常: {str(e)}"
+
+
+# =====================================================================
+# CLI 业务命令实现
+# =====================================================================
+
+def cmd_config(args, mgr):
+    """配置 Cloudflare Token、Zone、Zero Trust APP 及 VPS IP"""
+    conf = mgr.load_config()
+
+    if args.token:
+        conf['api_token'] = args.token.strip()
+    if args.app:
+        conf['app_name'] = args.app.strip()
+    if args.zone:
+        conf['zone_name'] = args.zone.strip()
+    if args.ip:
+        conf['server_ip'] = args.ip.strip()
+
+    if any([args.token, args.app, args.zone, args.ip]):
+        mgr.save_config(conf)
+        print(c_green("✅ 配置已成功保存！"))
+
+    # 输出当前配置状态
+    current_ip = mgr.get_server_ip()
+    token = mgr.get_token()
+    masked = (token[:8] + '...' + token[-6:]) if len(token) > 16 else ('未配置' if not token else token)
+
+    print(c_bold("\n=== 当前 bt-cf 配置详情 ==="))
+    print(f"配置文件路径:      {mgr.config_file}")
+    print(f"当前 VPS 公网 IP:  {c_blue(current_ip)} {'(静态指定)' if conf.get('server_ip') else '(动态检测)'}")
+    print(f"Cloudflare Token:  {c_green(masked)}")
+    print(f"Zero Trust APP:    {c_orange(mgr.get_app_name())}")
+    print(f"默认托管 Zone:     {conf.get('zone_name') or '自动匹配'}")
+    print(c_yellow("\n提示: 可使用 'bt-cf config --token <Token> --app APP' 进行修改。\n"))
+    return 0
+
+
+def cmd_status(args, mgr):
+    """测试 Cloudflare API 与环境连接状态"""
+    print(c_bold("\n=== 正在检查 Cloudflare & 节点通信状态 ==="))
+    current_ip = mgr.get_server_ip()
+    token = mgr.get_token()
+    if not token:
+        print(c_red("错误: 未配置 Cloudflare API Token！"))
+        print(c_yellow("请先执行: bt-cf config --token <你的Token>"))
+        return 1
+
+    masked = (token[:8] + '...' + token[-6:]) if len(token) > 16 else token
+    print(f"当前节点 VPS IP:  {c_blue(current_ip)}")
+    print(f"API Token 凭证:   {masked}")
+    print(f"Zero Trust APP:   {c_orange(mgr.get_app_name())}")
+
+    print("\n正在向 Cloudflare 发送探测请求...")
+    ok, data = mgr.test_connection()
+    if not ok:
+        print(c_red(f"❌ 连接失败: {data}"))
+        return 1
+
+    print(c_green("✅ API Token 验证通过！"))
+    print(f"Cloudflare 账户:  {data.get('account_name')} (ID: {data.get('account_id')})")
+
+    zones = data.get('zones', [])
+    zone_names = [z.get('name') for z in zones]
+    print(f"已接入 Zone 域名:  {', '.join(zone_names) if zone_names else '无'}")
+
+    app = data.get('app')
+    if app:
+        print(c_green(f"✅ 找到 Zero Trust 应用程序: {app.get('name')} (ID: {app.get('id')})"))
+        print(f"受保护域名主记录:  {app.get('domain')}")
+    else:
+        print(c_yellow(f"⚠️  未找到名为 [{mgr.get_app_name()}] 的 Zero Trust 应用程序"))
+
+    print("")
+    return 0
+
+
+def cmd_list(args, mgr):
+    """列出当前 VPS 上 aaPanel 的所有域名，并展示 Zero Trust 与 DNS 状态"""
+    if not public:
+        print(c_red("错误: 当前环境未检测到 aaPanel (宝塔) 核心组件！"))
+        return 1
+
+    token = mgr.get_token()
+    if not token:
+        print(c_red("错误: 未配置 Cloudflare API Token！"))
+        print(c_yellow("请先运行配置命令: bt-cf config --token <你的Cloudflare_Token> --app APP"))
+        return 1
+
+    current_ip = mgr.get_server_ip()
+    print(c_blue(f"正在从 aaPanel 与 Cloudflare 同步域名状态 (节点 IP: {current_ip})..."))
+
+    # 1. 查询 aaPanel 站点与反向代理
+    sites = public.M('sites').field('id,name,path,status').order('id asc').select() or []
+    domains_db = public.M('domain').field('id,pid,name').select() or []
+    site_domains_map = {}
+    for d in domains_db:
+        pid = d.get('pid')
+        if pid not in site_domains_map:
+            site_domains_map[pid] = []
+        name = d.get('name', '').strip()
+        if name and name not in site_domains_map[pid]:
+            site_domains_map[pid].append(name)
+
+    proxies_map = get_site_proxies()
+
+    # 2. 查询 Zero Trust 域名清单
+    ok_zt, zt_res = mgr.get_zt_domains()
+    if not ok_zt:
+        print(c_yellow(f"⚠️  警告: 获取 Zero Trust 域名清单失败: {zt_res}"))
+        zt_domains_set = set()
+    else:
+        zt_domains_set = set(d.lower().strip() for d in zt_res.get('domains', []))
+
+    # 3. 查询 Cloudflare 中所有 A 记录 (支持 per_page=100)
+    cf_dns_map = {}
+    ok_z, zones = mgr.cf_request('GET', '/zones?per_page=50')
+    if not ok_z:
+        print(c_red(f"❌ 无法从 Cloudflare 获取域名托管区域 (Zones): {zones}"))
+        print(c_yellow("请检查 API Token 权限 (需要 Zone.DNS 读写权限) 或检查是否有 IP 访问限制！"))
+        return 1
+
+    if zones:
+        for z in zones:
+            zid = z.get('id')
+            ok_r, recs = mgr.cf_request('GET', f'/zones/{zid}/dns_records?type=A&per_page=100')
+            if not ok_r:
+                print(c_yellow(f"⚠️  获取 Zone [{z.get('name')}] DNS 记录失败: {recs}"))
+            elif isinstance(recs, list):
+                for r in recs:
+                    d_name = r.get('name', '').lower().strip()
+                    cf_dns_map[d_name] = {
+                        "content": r.get('content', ''),
+                        "proxied": r.get('proxied', False)
+                    }
+
+    listening_procs = get_listening_processes()
+
+    print(f"\n{c_bold('aaPanel 站点域名与 Cloudflare 状态清单:')}")
+    col_w = [4, 25, 4, 12, 22, 10, 8]
+    line_len = sum(col_w) + (len(col_w) - 1) * 2
+
+    header_line = "  ".join([
+        pad_visible("ID", col_w[0]),
+        pad_visible("域名", col_w[1]),
+        pad_visible("状态", col_w[2], align='center'),
+        pad_visible("反代目标", col_w[3]),
+        pad_visible("反代进程", col_w[4]),
+        pad_visible("Zero Trust", col_w[5], align='center'),
+        pad_visible("小橙云", col_w[6])
+    ])
+
+    print("-" * line_len)
+    print(c_bold(header_line))
+    print("-" * line_len)
+
+    for s in sites:
+        sid = s.get('id')
+        primary_name = s.get('name', '').strip()
+        all_doms = [primary_name]
+        for extra in site_domains_map.get(sid, []):
+            if extra.lower() != primary_name.lower():
+                all_doms.append(extra)
+
+        site_status_txt = c_green("✅") if str(s.get('status')) == '1' else c_red("❌")
+
+        for idx, dom in enumerate(all_doms):
+            dom_lower = dom.lower()
+
+            # 反向代理信息 (若别名域名未单独配置代理，回退使用主站点反代配置)
+            proxy_val = proxies_map.get(dom_lower, "") or proxies_map.get(primary_name.lower(), "")
+            if proxy_val:
+                clean_p = proxy_val.replace('http://', '').replace('https://', '').rstrip('/')
+                if clean_p.startswith('127.0.0.1:'):
+                    proxy_display = c_blue(':' + clean_p.split('127.0.0.1:')[1])
+                elif clean_p.startswith('localhost:'):
+                    proxy_display = c_blue(':' + clean_p.split('localhost:')[1])
+                elif clean_p in ['127.0.0.1', 'localhost']:
+                    proxy_display = c_blue(':80')
+                else:
+                    if len(clean_p) > col_w[3]:
+                        clean_p = clean_p[:col_w[3] - 2] + '..'
+                    proxy_display = c_blue(clean_p)
+            else:
+                proxy_display = "-"
+
+            # 反代端口运行进程信息
+            target_type, port_or_host = extract_proxy_port(proxy_val, current_ip)
+            if target_type == 'LOCAL':
+                if port_or_host in listening_procs:
+                    proc_info = listening_procs[port_or_host]
+                    if visible_len(proc_info) > col_w[4]:
+                        proc_info = proc_info[:col_w[4] - 2] + '..'
+                    proc_display = c_green(proc_info)
+                else:
+                    proc_display = c_red("🔴 未监听")
+            elif target_type == 'EXTERNAL':
+                proc_display = c_blue("🌐 外部目标")
+            else:
+                proc_display = "-"
+
+            is_zt = dom_lower in zt_domains_set
+            zt_txt = c_green("🔒") if is_zt else c_yellow("⚪")
+
+            dns_info = cf_dns_map.get(dom_lower)
+            if dns_info:
+                proxy_txt = c_orange("开启") if dns_info['proxied'] else "仅DNS"
+            else:
+                proxy_txt = "-"
+
+            site_id_str = str(sid) if idx == 0 else ""
+            status_col = site_status_txt if idx == 0 else ""
+
+            row_str = "  ".join([
+                pad_visible(site_id_str, col_w[0]),
+                pad_visible(dom, col_w[1]),
+                pad_visible(status_col, col_w[2], align='center'),
+                pad_visible(proxy_display, col_w[3]),
+                pad_visible(proc_display, col_w[4]),
+                pad_visible(zt_txt, col_w[5], align='center'),
+                pad_visible(proxy_txt, col_w[6])
+            ])
+            print(row_str)
+
+    print("-" * line_len)
+    app_name = mgr.get_app_name()
+    print(f"统计: aaPanel 共有 {c_bold(str(len(sites)))} 个站点，Zero Trust ({app_name}) 共有 {c_bold(str(len(zt_domains_set)))} 个保护域名。\n")
+    return 0
+
+
+def cmd_check(args, mgr):
+    """检查是否有 Cloudflare 解析到本机，但在 aaPanel 上不存在的域名"""
+    if not public:
+        print(c_red("错误: 未检测到 aaPanel 核心环境"))
+        return 1
+
+    current_ip = mgr.get_server_ip()
+    print(c_blue(f"正在扫描 Cloudflare 中解析至本 VPS IP [{current_ip}] 的域名记录..."))
+
+    # 1. 查找 Cloudflare 指向当前 IP 的所有 A 记录
+    cf_records_pointing_here = []
+    ok_z, zones = mgr.cf_request('GET', '/zones')
+    if not ok_z or not zones:
+        print(c_red(f"无法从 Cloudflare 获取 Zones 列表: {zones}"))
+        return 1
+
+    for z in zones:
+        zid = z.get('id')
+        ok_r, recs = mgr.cf_request('GET', f'/zones/{zid}/dns_records?type=A&content={current_ip}&per_page=100')
+        if ok_r and isinstance(recs, list):
+            for r in recs:
+                cf_records_pointing_here.append({
+                    "name": r.get('name', '').lower().strip(),
+                    "proxied": r.get('proxied', False),
+                    "zone_id": zid
+                })
+
+    # 2. 从 aaPanel 查询所有已登记域名
+    panel_domains = set()
+    sites = public.M('sites').field('id,name').select() or []
+    for s in sites:
+        n = s.get('name', '').lower().strip()
+        if n: panel_domains.add(n)
+
+    domains_db = public.M('domain').field('id,name').select() or []
+    for d in domains_db:
+        n = d.get('name', '').lower().strip()
+        if n: panel_domains.add(n)
+
+    # 3. 查询 Zero Trust 状态
+    ok_zt, zt_res = mgr.get_zt_domains()
+    zt_domains_set = set(d.lower().strip() for d in zt_res.get('domains', [])) if ok_zt else set()
+
+    # 4. 比对差异
+    missing_in_panel = [cf for cf in cf_records_pointing_here if cf['name'] not in panel_domains]
+    cf_all_pointed_names = set(cf['name'] for cf in cf_records_pointing_here)
+    missing_in_cf = [d for d in panel_domains if d not in cf_all_pointed_names]
+
+    print("\n" + "=" * 90)
+    print(c_bold("🔍 域名一致性核查报告:"))
+    print("=" * 90)
+
+    if missing_in_panel:
+        print(c_yellow(f"\n⚠️  发现 {len(missing_in_panel)} 个域名已在 Cloudflare 解析到本机，但在 aaPanel 中未创建站点:"))
+        print("-" * 90)
+        c_w = [30, 20, 20]
+        print(c_bold("  " + "  ".join([
+            pad_visible("域名 (Domain)", c_w[0]),
+            pad_visible("Zero Trust 状态", c_w[1]),
+            pad_visible("小橙云代理", c_w[2])
+        ])))
+        print("-" * 90)
+        for item in missing_in_panel:
+            dname = item['name']
+            in_zt = dname in zt_domains_set
+            zt_txt = c_green("🔒 已保护") if in_zt else c_yellow("⚪ 未保护")
+            proxy_txt = c_orange("☁️ 开启 (Proxied)") if item['proxied'] else "☁️ 仅DNS"
+            row_str = "  " + "  ".join([
+                pad_visible(dname, c_w[0]),
+                pad_visible(zt_txt, c_w[1]),
+                pad_visible(proxy_txt, c_w[2])
+            ])
+            print(row_str)
+        print("-" * 90)
+        print(c_yellow("建议: 如需在当前 VPS 创建以上站点，可执行:"))
+        for item in missing_in_panel:
+            print(f"  {c_blue('bt-cf add ' + item['name'])}")
+    else:
+        print(c_green("\n✅ 没有发现未在 aaPanel 登记的孤立 Cloudflare 域名。所有指向本机的解析均已在面板建立。"))
+
+    if missing_in_cf:
+        print(c_yellow(f"\n⚠️  发现 {len(missing_in_cf)} 个 aaPanel 域名未在 Cloudflare 发现指向当前 IP 的 A 记录:"))
+        for d in missing_in_cf:
+            print(f"  - {d}")
+        print(c_yellow("提示: 若这些域名使用其他 DNS 服务商或仅用于内网，可忽略此提示。"))
+
+    print("\n" + "=" * 90)
+    print(f"核查总结: Cloudflare 解析到当前 IP ({current_ip}) 的域名共 {len(cf_records_pointing_here)} 个，aaPanel 已登记 {len(panel_domains)} 个。")
+    print("=" * 90 + "\n")
+    return 0
+
+
+def cmd_add(args, mgr):
+    """添加站点并联动同步 Cloudflare DNS 与 Zero Trust"""
+    domain = args.domain.strip().lower()
+    if not domain or not re.match(r"^([\w\-\*]{1,100}\.){1,24}([\w\-]{1,24}|[\w\-]{1,24}\.[\w\-]{1,24})$", domain):
+        print(c_red(f"错误: 域名格式不正确 [{domain}]"))
+        return 1
+
+    current_ip = mgr.get_server_ip()
+    is_proxied = not args.no_proxy
+    is_zt = not args.no_zt
+    site_path = args.path or f"/www/wwwroot/{domain}"
+
+    # 判断反向代理端口 / 目标
+    proxy_target = getattr(args, 'proxy_port', None) or getattr(args, 'proxy_site', None)
+    raw_port = str(getattr(args, 'port', '') or '').strip()
+    if raw_port and raw_port not in ['80', ''] and not proxy_target:
+        proxy_target = raw_port
+        print(c_yellow(f"提示: 检测到端口参数 [--port {raw_port}]，自动将其作为反向代理目标端口。"))
+
+    listen_port = str(getattr(args, 'listen_port', 80) or 80)
+
+    print(c_bold(f"\n=== 开始创建与配置站点: {c_blue(domain)} ==="))
+    print(f"目标 VPS IP:   {c_blue(current_ip)}")
+    if proxy_target:
+        print(f"反向代理目标:  {c_blue(str(proxy_target))}")
+    print(f"小橙云代理:    {c_orange('开启 (Proxied)') if is_proxied else '关闭 (仅普通DNS)'}")
+    print(f"Zero Trust:    {c_green('加入 APP 保护') if is_zt else '不加入'}")
+    print(f"站点根目录:    {site_path}")
+
+    # 1. aaPanel 站点创建与配置
+    if not args.skip_panel:
+        if not panelSite or not public:
+            print(c_red("错误: 未检测到 aaPanel 环境，无法创建本地站点 (可通过 --skip-panel 仅配置 Cloudflare)"))
+            return 1
+
+        existing = public.M('sites').where('name=?', (domain,)).count()
+        if existing:
+            print(c_yellow(f"\n[1/3] 提示: aaPanel 中已存在名为 [{domain}] 的站点，跳过建站步骤。"))
+        else:
+            print(f"\n[1/3] 正在 aaPanel 中创建网站 [{domain}] ...")
+            try:
+                get = public.dict_obj()
+                get.webname = json.dumps({'domain': domain, 'domainlist': [], 'count': 0})
+                get.path = site_path
+                get.port = listen_port
+                get.version = '00'  # 纯静态 / 反向代理默认配置
+                get.ps = domain
+                get.ftp = False
+                get.sql = False
+
+                ps = panelSite.panelSite()
+                res = ps.AddSite(get)
+                if res.get('siteStatus'):
+                    print(c_green(f"  ✅ aaPanel 站点创建成功！(ID: {res.get('siteId')})"))
+                else:
+                    msg = res.get('msg', '未知错误')
+                    print(c_red(f"  ❌ aaPanel 站点创建失败: {msg}"))
+                    return 1
+            except Exception as e:
+                print(c_red(f"  ❌ aaPanel 创建站点异常: {str(e)}"))
+                return 1
+
+        # 1.1 配置反向代理
+        if proxy_target:
+            ok_px, px_msg = setup_site_proxy(domain, proxy_target)
+            if ok_px:
+                print(c_green(f"  ✅ 已配置反向代理: / -> {px_msg}"))
+            else:
+                print(c_yellow(f"  ⚠️  反向代理配置失败: {px_msg}"))
+
+        # 1.2 自动配置 SSL (默认开启)
+        if not getattr(args, 'no_ssl', False):
+            ok_ssl, ssl_msg = configure_site_ssl(domain)
+            if ok_ssl:
+                print(c_green(f"  ✅ {ssl_msg}"))
+            else:
+                print(c_yellow(f"  ⚠️  SSL 配置未完成: {ssl_msg} (站点仍可在 HTTP 80 正常访问)"))
+    else:
+        print("\n[1/3] 已指定 --skip-panel，跳过本地 aaPanel 站点创建。")
+
+    # 2. Cloudflare DNS 同步
+    if not args.skip_cf:
+        print(f"\n[2/3] 正在向 Cloudflare 同步 DNS A 记录 ({domain} -> {current_ip}, Proxied: {is_proxied}) ...")
+        ok_z, zone = mgr.find_matching_zone(domain)
+        if not ok_z or not zone:
+            print(c_red(f"  ❌ 未在 Cloudflare 中找到匹配的 Zone: {zone}"))
+        else:
+            zid = zone['id']
+            ok_q, records = mgr.cf_request('GET', f"/zones/{zid}/dns_records?name={domain}&type=A")
+            dns_payload = {
+                "type": "A",
+                "name": domain,
+                "content": current_ip,
+                "ttl": 1 if is_proxied else 300,
+                "proxied": is_proxied
+            }
+
+            if ok_q and isinstance(records, list) and len(records) > 0:
+                rec_id = records[0]['id']
+                ok_u, res_u = mgr.cf_request('PUT', f"/zones/{zid}/dns_records/{rec_id}", dns_payload)
+                if ok_u:
+                    print(c_green(f"  ✅ DNS A 记录已更新！(目标: {current_ip}, Proxied: {is_proxied})"))
+                else:
+                    print(c_red(f"  ❌ DNS A 记录更新失败: {res_u}"))
+            else:
+                ok_c, res_c = mgr.cf_request('POST', f"/zones/{zid}/dns_records", dns_payload)
+                if ok_c:
+                    print(c_green(f"  ✅ DNS A 记录创建成功！(目标: {current_ip}, Proxied: {is_proxied})"))
+                else:
+                    print(c_red(f"  ❌ DNS A 记录创建失败: {res_c}"))
+
+        # 3. Zero Trust 同步
+        if is_zt:
+            app_name = mgr.get_app_name()
+            print(f"\n[3/3] 正在将 [{domain}] 添加到 Zero Trust ({app_name}) ...")
+            ok_zt, msg_zt = mgr.toggle_domain_zt(domain, action='add')
+            if ok_zt:
+                print(c_green(f"  ✅ {msg_zt}"))
+            else:
+                print(c_red(f"  ❌ 添加到 Zero Trust 失败: {msg_zt}"))
+        else:
+            print("\n[3/3] 参数指定不加入 Zero Trust，跳过。")
+    else:
+        print("\n[2/3] 已指定 --skip-cf，跳过 Cloudflare 联动。")
+
+    print(c_bold(f"\n🎉 站点 [{domain}] 配置流程全部完成！\n"))
+    return 0
+
+
+def cmd_toggle_zt(args, mgr):
+    """一键开启或关闭指定域名的 Zero Trust 保护"""
+    domain = args.domain.strip().lower()
+    action = args.action.lower() if args.action else 'toggle'
+
+    label = "开启" if action == 'on' else ("关闭" if action == 'off' else "切换")
+    print(c_blue(f"正在为 [{domain}] {label} Cloudflare Zero Trust 保护..."))
+
+    ok, msg = mgr.toggle_domain_zt(domain, action)
+    if ok:
+        print(c_green(f"✅ {msg}"))
+    else:
+        print(c_red(f"❌ {msg}"))
+    return 0 if ok else 1
+
+
+def cmd_del(args, mgr):
+    """删除本地站点并可选同步清理 Cloudflare 记录"""
+    domain = args.domain.strip().lower()
+    print(c_bold(f"\n=== 删除站点/域名: {c_red(domain)} ==="))
+
+    if public and panelSite:
+        site = public.M('sites').where('name=?', (domain,)).find()
+        if site:
+            print(f"正在从 aaPanel 中删除站点 [{domain}] (ID: {site.get('id')}) ...")
+            try:
+                get = public.dict_obj()
+                get.id = site.get('id')
+                get.webname = domain
+                del_res = panelSite.panelSite().DeleteSite(get)
+                if del_res.get('status'):
+                    print(c_green("  ✅ aaPanel 站点已删除"))
+                else:
+                    print(c_red(f"  ❌ 删除站点失败: {del_res.get('msg')}"))
+            except Exception as e:
+                print(c_red(f"  ❌ 删除本地站点异常: {e}"))
+        else:
+            print(c_yellow(f"  提示: aaPanel 中未找到名为 [{domain}] 的站点。"))
+
+    if not args.keep_cf:
+        print(f"正在从 Cloudflare Zero Trust 中移出 [{domain}] ...")
+        mgr.toggle_domain_zt(domain, action='off')
+
+        print(f"正在从 Cloudflare DNS 中删除 [{domain}] ...")
+        ok_z, zone = mgr.find_matching_zone(domain)
+        if ok_z and zone:
+            zid = zone['id']
+            ok_r, recs = mgr.cf_request('GET', f"/zones/{zid}/dns_records?name={domain}&type=A")
+            if ok_r and isinstance(recs, list) and recs:
+                for r in recs:
+                    mgr.cf_request('DELETE', f"/zones/{zid}/dns_records/{r['id']}")
+                print(c_green("  ✅ Cloudflare DNS A 记录已删除"))
+            else:
+                print(c_yellow("  提示: Cloudflare 中未找到该域名的 A 记录"))
+    else:
+        print(c_yellow("  提示: 已保留 Cloudflare DNS 与 Zero Trust 配置 (--keep-cf)。"))
+
+    print(c_bold("\n操作已完成。\n"))
+    return 0
+
+
+def cmd_proxy(args, mgr):
+    """修改指定站点 (支持站点 ID 或域名) 的反向代理端口/目标"""
+    site, err = resolve_site_target(args.target)
+    if err or not site:
+        print(c_red(f"❌ {err}"))
+        return 1
+
+    domain = site.get('name', '').strip().lower()
+    sid = site.get('id')
+
+    proxies_map = get_site_proxies()
+    old_proxy = proxies_map.get(domain, "无")
+
+    print(c_blue(f"正在更新站点 [{domain}] (ID: {sid}) 的反向代理目标 (原目标: {old_proxy})..."))
+
+    ok, res_msg = update_site_proxy(domain, args.port)
+    if not ok:
+        print(c_red(f"❌ 修改反向代理失败: {res_msg}"))
+        return 1
+
+    print(c_green(f"✅ 反向代理已更新: {domain} -> {res_msg}"))
+
+    # 附带端口监听状态提示
+    target_type, port_or_host = extract_proxy_port(res_msg, mgr.get_server_ip())
+    if target_type == 'LOCAL' and port_or_host:
+        listening_procs = get_listening_processes()
+        if port_or_host in listening_procs:
+            print(c_green(f"   当前端口进程: {listening_procs[port_or_host]}"))
+        else:
+            print(c_yellow(f"   ⚠️  提示: 本地端口 :{port_or_host} 当前未处于监听状态"))
+
+    return 0
+
+
+def cmd_update(args, mgr):
+    """从 GitHub 远程仓库拉取并更新 bt-cf 到最新版本"""
+    target_bin = "/usr/local/bin/bt-cf"
+    curr_script = os.path.realpath(os.path.abspath(__file__))
+
+    # 检查写入权限
+    if os.geteuid() != 0 and not os.access(target_bin, os.W_OK):
+        print(c_red("错误: 更新 bt-cf 需要 root 权限，请使用 sudo bt-cf update 或切换至 root 执行！"))
+        return 1
+
+    print(c_blue("正在从 GitHub 检查并获取最新版本的 bt-cf ..."))
+
+    # 1. 尝试寻找本机已有的 git 源码仓库目录 (包含当前运行路径及常用路径)
+    candidate_repos = []
+    for p in [os.path.dirname(curr_script), "/root/project/bt-cf", "/root/bt-cf"]:
+        if p and p not in candidate_repos and os.path.isdir(os.path.join(p, '.git')):
+            candidate_repos.append(p)
+
+    if not getattr(args, 'url', None):
+        for r_dir in candidate_repos:
+            try:
+                diff_chk = subprocess.run(['git', '-C', r_dir, 'status', '--porcelain'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+                if diff_chk.returncode == 0 and not diff_chk.stdout.strip():
+                    res = subprocess.run(['git', '-C', r_dir, 'pull'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=12)
+                    if res.returncode == 0:
+                        src_file = os.path.join(r_dir, 'bt-cf')
+                        if os.path.exists(src_file):
+                            import shutil
+                            shutil.copyfile(src_file, target_bin)
+                            os.chmod(target_bin, 0o755)
+                            print(c_green(f"  ✅ Git 源码仓库已同步拉取: {r_dir}"))
+                            print(c_green(f"  ✅ 系统命令已更新: {target_bin}"))
+                            print(c_green("\n🎉 bt-cf 已成功更新至最新版本！可通过 bt-cf --help 确认。\n"))
+                            return 0
+            except Exception:
+                pass
+
+    # 2. 尝试从 Raw URL 下载 (适用于公开仓库一键部署模式，或带 Token 私有访问)
+    raw_urls = [
+        "https://raw.githubusercontent.com/wumingshi654/bt-cf/main/bt-cf",
+        "https://cdn.jsdelivr.net/gh/wumingshi654/bt-cf@main/bt-cf",
+        "https://fastly.jsdelivr.net/gh/wumingshi654/bt-cf@main/bt-cf"
+    ]
+    if getattr(args, 'url', None):
+        raw_urls.insert(0, args.url)
+
+    gh_token = os.environ.get('GITHUB_TOKEN') or os.environ.get('GH_TOKEN')
+    if not gh_token and os.path.exists('/etc/bt-cf/config.json'):
+        try:
+            with open('/etc/bt-cf/config.json', 'r') as f:
+                cfg = json.load(f)
+                gh_token = cfg.get('github_token')
+        except Exception:
+            pass
+
+    tmp_file = "/tmp/bt-cf.update.tmp"
+    downloaded = False
+    download_err = ""
+
+    for url in raw_urls:
+        try:
+            cmd = ['curl', '-fsSL', '--connect-timeout', '10']
+            if gh_token:
+                cmd.extend(['-H', f'Authorization: token {gh_token}'])
+            cmd.extend(['-o', tmp_file, url])
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+            if res.returncode == 0 and os.path.exists(tmp_file) and os.path.getsize(tmp_file) > 10240:
+                with open(tmp_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                if '#!/usr/bin/env python3' in content and 'aaPanel' in content:
+                    compile(content, tmp_file, 'exec')
+                    downloaded = True
+                    break
+        except Exception as e:
+            download_err = str(e)
+            continue
+
+    # 3. 若 Raw URL 下载失败 (例如私有仓库未公开)，尝试通过 Git SSH 浅克隆回退获取
+    if not downloaded and not getattr(args, 'url', None):
+        ssh_remotes = ["git@github.com:wumingshi654/bt-cf.git"]
+        tmp_git_dir = "/tmp/bt-cf-git-update"
+        for s_remote in ssh_remotes:
+            try:
+                if os.path.exists(tmp_git_dir):
+                    import shutil
+                    shutil.rmtree(tmp_git_dir, ignore_errors=True)
+                res = subprocess.run(
+                    ['git', 'clone', '--depth=1', '--quiet', s_remote, tmp_git_dir],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15
+                )
+                if res.returncode == 0:
+                    cloned_bin = os.path.join(tmp_git_dir, 'bt-cf')
+                    if os.path.exists(cloned_bin) and os.path.getsize(cloned_bin) > 10240:
+                        import shutil
+                        shutil.copyfile(cloned_bin, tmp_file)
+                        shutil.rmtree(tmp_git_dir, ignore_errors=True)
+                        downloaded = True
+                        break
+            except Exception:
+                continue
+
+    if not downloaded:
+        print(c_red("❌ 下载或校验最新 bt-cf 失败！"))
+        print(c_yellow("排查建议:"))
+        print(c_yellow("  1. 请检查网络连接能否访问 GitHub。"))
+        print(c_yellow("  2. 若 GitHub 仓库为 Private (私有仓库)，请在 GitHub 仓库设置中将其设为 Public。"))
+        if download_err:
+            print(c_yellow(f"  3. 错误详情: {download_err}"))
+        return 1
+
+    try:
+        import shutil
+        os.chmod(tmp_file, 0o755)
+
+        # 1. 更新 target_bin (/usr/local/bin/bt-cf)
+        shutil.move(tmp_file, target_bin)
+        os.chmod(target_bin, 0o755)
+        print(c_green(f"  ✅ 系统命令已更新: {target_bin}"))
+
+        # 2. 如果当前执行脚本路径与 target_bin 不同且可写，也同步一份
+        if curr_script != target_bin and os.path.exists(curr_script):
+            try:
+                shutil.copyfile(target_bin, curr_script)
+                os.chmod(curr_script, 0o755)
+                print(c_green(f"  ✅ 本地脚本已同步: {curr_script}"))
+            except Exception:
+                pass
+
+        print(c_green("\n🎉 bt-cf 已成功更新至最新版本！可通过 bt-cf --help 确认命令。\n"))
+        return 0
+    except Exception as e:
+        print(c_red(f"❌ 替换目标文件失败: {e}"))
+        return 1
+
+
+# =====================================================================
+# 主入口
+# =====================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="bt-cf",
+        description="aaPanel & Cloudflare DNS / Zero Trust 联动管理 CLI 工具",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  bt-cf add test.example.com -p 8123         # 建站 + 反代到8123 + 默认SSL + 开启小橙云 + 加ZT
+  bt-cf add api.example.com --no-zt          # 开启小橙云，但不加入 Zero Trust
+  bt-cf add direct.example.com --no-proxy    # 仅普通DNS解析(直连)，加入 Zero Trust
+  bt-cf list                                 # 列出所有域名、反代端口、Zero Trust及DNS状态
+  bt-cf proxy 26 8123                        # 通过站点 ID 修改反代端口为 8123
+  bt-cf proxy app.example.com 8123           # 通过域名修改反代端口为 8123
+  bt-cf check                                # 检查解析到本机但 aaPanel 未添加的孤立域名
+  bt-cf toggle-zt test.example.com           # 一键翻转 Zero Trust 状态
+  bt-cf del test.example.com                 # 删除站点并同步清理 CF 记录
+  bt-cf update                               # 一键从 GitHub 检查并升级到最新版本
+  bt-cf config --token <Token> --app APP     # 配置或修改 Cloudflare 凭据
+  bt-cf status                               # 检查 Cloudflare API 与配置状态
+        """
+    )
+    # 全局参数
+    parser.add_argument("--ip", help="指定 VPS 公网 IP (默认自动检测本机外网 IP)")
+
+    subparsers = parser.add_subparsers(dest="subcommand", help="可用命令")
+
+    # 1. add
+    p_add = subparsers.add_parser("add", help="添加新域名/站点，同步 Cloudflare DNS 与 Zero Trust")
+    p_add.add_argument("domain", help="要添加的完整域名 (如 demo.example.com)")
+    p_add.add_argument("--proxy-port", "-p", help="反向代理目标端口 (例如: 8123，将反代至 http://127.0.0.1:8123)")
+    p_add.add_argument("--proxy-site", help="反向代理完整目标地址 (例如: http://127.0.0.1:8123)")
+    p_add.add_argument("--port", help="指定端口 (若传入如 8123，自动作为反代端口配置)")
+    p_add.add_argument("--listen-port", type=int, default=80, help="Nginx 监听端口 (默认: 80)")
+    p_add.add_argument("--no-ssl", action="store_true", help="不自动配置 SSL (默认会自动配置并启用 443 端口)")
+    p_add.add_argument("--proxy", dest="no_proxy", action="store_false", default=False, help="开启 Cloudflare 小橙云代理 (默认开启)")
+    p_add.add_argument("--no-proxy", dest="no_proxy", action="store_true", help="关闭小橙云代理 (仅普通 DNS 解析)")
+    p_add.add_argument("--zt", dest="no_zt", action="store_false", default=False, help="加入 Cloudflare Zero Trust (默认加入)")
+    p_add.add_argument("--no-zt", dest="no_zt", action="store_true", help="不加入 Zero Trust")
+    p_add.add_argument("--path", help="站点根目录 (默认: /www/wwwroot/<域名>)")
+    p_add.add_argument("--skip-panel", action="store_true", help="仅配置 Cloudflare，跳过创建本地 aaPanel 站点")
+    p_add.add_argument("--skip-cf", action="store_true", help="仅创建本地 aaPanel 站点，跳过 Cloudflare 同步")
+
+    # 2. list
+    subparsers.add_parser("list", help="列出 aaPanel 所有域名及其 Zero Trust 与 DNS 状态")
+
+    # 3. check
+    subparsers.add_parser("check", help="检查 Cloudflare 上解析到本机的域名，但在 aaPanel 上不存在的记录")
+
+    # 4. toggle-zt
+    p_zt = subparsers.add_parser("toggle-zt", help="切换某个域名的 Zero Trust 保护状态")
+    p_zt.add_argument("domain", help="要切换保护的域名")
+    p_zt.add_argument("action", nargs="?", choices=["on", "off"], help="强制开启 (on) 或强制关闭 (off)，留空则自动切换")
+
+    # 5. del
+    p_del = subparsers.add_parser("del", help="删除站点，并可选同步删除 Cloudflare 记录")
+    p_del.add_argument("domain", help="要删除的域名")
+    p_del.add_argument("--keep-cf", action="store_true", help="仅从 aaPanel 删除站点，保留 Cloudflare 记录")
+
+    # 6. config
+    p_cfg = subparsers.add_parser("config", help="查看或更新 Cloudflare 凭证与配置")
+    p_cfg.add_argument("--token", help="Cloudflare API Token")
+    p_cfg.add_argument("--app", help="Zero Trust 应用程序名称 (如 APP)")
+    p_cfg.add_argument("--zone", help="默认托管 Zone 域名 (如 example.com)")
+
+    # 7. status
+    subparsers.add_parser("status", help="检查 Cloudflare API 凭证与连接状态")
+
+    # 8. proxy
+    p_proxy = subparsers.add_parser("proxy", help="更改指定站点 (支持站点 ID 或域名) 的反向代理端口/目标")
+    p_proxy.add_argument("target", help="aaPanel 站点 ID (如 26) 或域名 (如 app.example.com)")
+    p_proxy.add_argument("port", help="新的反代端口或目标 URL (如 8123 或 http://127.0.0.1:8123)")
+
+    # 9. update
+    p_up = subparsers.add_parser("update", help="从 GitHub 仓库一键检查并更新 bt-cf 到最新版本")
+    p_up.add_argument("--url", help="自定义远程更新脚本的 URL 地址")
+
+    args = parser.parse_args()
+
+    if not args.subcommand:
+        parser.print_help()
+        sys.exit(0)
+
+    mgr = CloudflareManager(override_ip=args.ip)
+
+    dispatch = {
+        "config": cmd_config,
+        "status": cmd_status,
+        "list": cmd_list,
+        "check": cmd_check,
+        "add": cmd_add,
+        "toggle-zt": cmd_toggle_zt,
+        "del": cmd_del,
+        "proxy": cmd_proxy,
+        "update": cmd_update
+    }
+
+    func = dispatch.get(args.subcommand)
+    if func:
+        code = func(args, mgr)
+        sys.exit(code or 0)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

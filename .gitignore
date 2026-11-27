@@ -1,0 +1,19 @@
+# Sensitive credentials
+config.json
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs and databases
+*.log
+*.sqlite
+*.db
+
+# OS / Editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.bak*
